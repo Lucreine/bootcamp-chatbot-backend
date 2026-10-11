@@ -14,14 +14,26 @@ from database.models import Conversation, Message
 
 load_dotenv()
 
-RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
-RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
-MODEL = os.getenv("RODIUMAI_MODEL", "anthropic/claude-sonnet-4-5-20250929")
+# RODIUMAI_URL = "https://api.rodiumai.io/v1/chat/completions"
+# RODIUMAI_API_KEY = os.environ["RODIUMAI_API_KEY"]
+RODIUMAI_API_KEY = os.getenv("RODIUMAI_API_KEY")
+RODIUMAI_URL = os.getenv("RODIUMAI_URL")
+
+
+MODEL = os.getenv("RODIUMAI_MODEL")
 PREVIEW_LENGTH = 60
 
 # Roles the LLM understands. Anything else stored in the DB (e.g. notifications) stays out of its prompt.
 LLM_ROLES = {"user", "assistant"}
 NOTIFICATION_ROLE = "system-notification"
+
+NOTE_ROLE = "note"
+
+NON_LLM_ROLES = {
+    NOTIFICATION_ROLE,
+    NOTE_ROLE,
+}
+
 NOTIFICATION_EVERY = 10  # a notification each time the dialogue reaches a multiple of this many messages
 NOTIFICATION_TEXT = "Notification système : Une dizaine de messages écrits."
 
@@ -47,6 +59,8 @@ class ChatRequest(BaseModel):
     conversation_id: int
     message: str
 
+class NoteRequest(BaseModel):
+    content: str
 
 class ChatResponse(BaseModel):
     reply: str
@@ -74,7 +88,7 @@ def load_messages(db: Session, conversation_id: int) -> list[Message]:
 def build_llm_history(rows: list[Message]) -> list[dict]:
     # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
     # For now we only drop the roles the LLM doesn't know (system-notification).
-    return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES]
+    return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES and m.role not in NON_LLM_ROLES]
 
 
 @app.post("/conversations", status_code=201)
@@ -110,6 +124,50 @@ def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[M
         for m in load_messages(db, conversation_id)
     ]
 
+@app.post("/conversations/{conversation_id}/notes",
+    status_code=201,
+    response_model=MessageResponse,
+)
+def create_note(conversation_id: int, req: NoteRequest, db: Session = Depends(get_db)) -> list[MessageResponse]:
+    # Verify that the conversation exists and retrieve its messages.
+    rows = load_messages(db, conversation_id)
+
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="Note content cannot be empty.",
+        )
+
+    # Every message, including notes and notifications, has a unique sequence number in the conversation.
+    next_seq = rows[-1].seq + 1 if rows else 1
+
+    note = Message(
+        conversation_id=conversation_id,
+        seq=next_seq,
+        role=NOTE_ROLE,
+        content=content,
+    )
+
+    db.add(note)
+
+    try:
+        db.commit()
+        db.refresh(note)
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="The conversation was updated concurrently. Please retry.",
+        ) from exc
+
+    return MessageResponse(
+        seq=note.seq,
+        role=note.role,
+        content=note.content,
+        created_at=note.created_at,
+    )
+
 
 @app.post("/chat")
 def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
@@ -122,10 +180,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
 
     # The LLM is stateless: resend the system prompt + the whole conversation each turn.
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
-
+    chat_completion="/chat/completions"
     try:
         response = httpx.post(
-            RODIUMAI_URL,
+            f"{RODIUMAI_URL.rstrip('/')}{chat_completion}",
             headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
             json={
                 "model": MODEL,
@@ -136,8 +194,20 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             timeout=30,
         )
         response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        print("Erreur HTTP RodiumAI :", exc.response.status_code)
+        print("Détail RodiumAI :", exc.response.text[:1000])
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM API call failed."
+        ) from exc
+        
     except httpx.HTTPError as exc:
-        raise HTTPException(status_code=502, detail="The LLM API call failed.") from exc
+        print("Erreur de connexion RodiumAI :", type(exc).__name__, str(exc))
+        raise HTTPException(
+            status_code=502,
+            detail="The LLM API call failed."
+        ) from exc
 
     reply = response.json()["choices"][0]["message"]["content"]
 
