@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session
 
 from database.db import get_db
 from database.models import Conversation, Message
+from pathlib import Path
+PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
+
 
 load_dotenv()
 
@@ -89,6 +92,10 @@ def build_llm_history(rows: list[Message]) -> list[dict]:
     # The DB history is not necessarily what the LLM sees: filter it here, just before building the request.
     # For now we only drop the roles the LLM doesn't know (system-notification).
     return [{"role": m.role, "content": m.content} for m in rows if m.role in LLM_ROLES and m.role not in NON_LLM_ROLES]
+
+
+def load_system_prompt() -> str:
+    return PROMPT_PATH.read_text(encoding="utf-8").strip()
 
 
 @app.post("/conversations", status_code=201)
@@ -179,7 +186,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
     user_message = {"role": "user", "content": req.message}
 
     # The LLM is stateless: resend the system prompt + the whole conversation each turn.
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
+    # messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
+    messages = [{"role": "system", "content": load_system_prompt()}, *history, user_message]
+
+
     chat_completion="/chat/completions"
     try:
         response = httpx.post(
@@ -201,7 +211,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
             status_code=502,
             detail="The LLM API call failed."
         ) from exc
-        
+
     except httpx.HTTPError as exc:
         print("Erreur de connexion RodiumAI :", type(exc).__name__, str(exc))
         raise HTTPException(
