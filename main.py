@@ -2,6 +2,7 @@ import os
 from datetime import datetime
 
 import httpx
+import json
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from database.db import get_db
 from database.models import Conversation, Message
 from pathlib import Path
+from fastapi.responses import StreamingResponse
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 
 
@@ -177,72 +179,153 @@ def create_note(conversation_id: int, req: NoteRequest, db: Session = Depends(ge
 
 
 @app.post("/chat")
-def chat(req: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
     # Load this conversation from the database, in message order.
     rows = load_messages(db, req.conversation_id)
     history = build_llm_history(rows)
+
+    content = req.message.strip()
+    if not content:
+        raise HTTPException(
+            status_code=422,
+            detail="The message cannot be empty.",
+        )
+
     # seq follows every stored row (notifications included) so it stays unique.
     next_seq = rows[-1].seq + 1 if rows else 1
-    user_message = {"role": "user", "content": req.message}
+    user_message = {"role": "user", "content": content}
 
     # The LLM is stateless: resend the system prompt + the whole conversation each turn.
     # messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, user_message]
     messages = [{"role": "system", "content": load_system_prompt()}, *history, user_message]
 
+    def send_event(data: dict) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
-    chat_completion="/chat/completions"
-    try:
-        response = httpx.post(
-            f"{RODIUMAI_URL.rstrip('/')}{chat_completion}",
-            headers={"Authorization": f"Bearer {RODIUMAI_API_KEY}"},
-            json={
-                "model": MODEL,
-                "messages": messages, 
-                "max_tokens": 512,
-                "stream": False,
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        print("Erreur HTTP RodiumAI :", exc.response.status_code)
-        print("Détail RodiumAI :", exc.response.text[:1000])
-        raise HTTPException(
-            status_code=502,
-            detail="The LLM API call failed."
-        ) from exc
+    def generate():
+        parts = []
+        completed = False
+        chat_completion="/chat/completions"
 
-    except httpx.HTTPError as exc:
-        print("Erreur de connexion RodiumAI :", type(exc).__name__, str(exc))
-        raise HTTPException(
-            status_code=502,
-            detail="The LLM API call failed."
-        ) from exc
+        try:
+            with httpx.stream(
+                "POST",
+                f"{RODIUMAI_URL.rstrip('/')}{chat_completion}",
+                headers={
+                    "Authorization": f"Bearer {RODIUMAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": MODEL,
+                    "messages": messages,
+                    "max_tokens": 512,
+                    "stream": True,
+                },
+                timeout=httpx.Timeout(60.0, connect=10.0),
+            ) as response:
+                response.raise_for_status()
 
-    reply = response.json()["choices"][0]["message"]["content"]
+                # Read flux SSE sended by RodiumAI.
+                for line in response.iter_lines():
+                    if not line.startswith("data:"):
+                        continue
 
-    # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
-    db.add_all([
-        Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-        Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
-    ])
+                    data = line[len("data:"):].strip()
 
-    # Count only the dialogue (user + assistant): counting notifications too would shift the total
-    # off the multiples of 10 for good after the first one.
-    notification = None
-    if (len(history) + 2) % NOTIFICATION_EVERY == 0:
-        notification = NOTIFICATION_TEXT
-        db.add(Message(
-            conversation_id=req.conversation_id, seq=next_seq + 2, role=NOTIFICATION_ROLE, content=notification
-        ))
+                    if data == "[DONE]":
+                        completed = True
+                        break
 
-    try:
-        db.commit()
-    except IntegrityError:
-        # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
-        db.rollback()
-        raise HTTPException(
-            status_code=409, detail="The conversation was updated concurrently, please retry."
-        )
-    print(history)
-    return ChatResponse(reply=reply, notification=notification)
+                    try:
+                        payload = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choices = payload.get("choices", [])
+                    if not choices:
+                        continue
+
+                    delta = choices[0].get("delta", {})
+                    token = delta.get("content")
+
+                    if isinstance(token, str) and token:
+                        parts.append(token)
+                        yield send_event({
+                            "type": "token",
+                            "content": token,
+                        })
+
+            # Closed connection without [DONE] is not a success.
+            if not completed:
+                db.rollback()
+                yield send_event({
+                    "type": "error",
+                    "message": "Model stream closed before completion.",
+                })
+                return
+
+            # Do not save anything until the generation process has completed normally. 
+            reply = "".join(parts)
+
+            # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
+            db.add_all([
+                Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
+                Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
+            ])
+
+            # Count only the dialogue (user + assistant): counting notifications too would shift the total
+            # off the multiples of 10 for good after the first one.
+            notification = None
+            if (len(history) + 2) % NOTIFICATION_EVERY == 0:
+                notification = NOTIFICATION_TEXT
+                db.add(Message(
+                    conversation_id=req.conversation_id, seq=next_seq + 2, role=NOTIFICATION_ROLE, content=notification
+                ))
+
+            try:
+                db.commit()
+            except IntegrityError:
+                # Another request already wrote these seq numbers in this conversation while we waited for the LLM.
+                db.rollback()
+                raise HTTPException(
+                    status_code=409, detail="The conversation was updated concurrently, please retry."
+                )
+
+            # The notification is sent only after the data has been successfully saved.
+            if notification:
+                yield send_event({
+                    "type": "notification",
+                    "content": notification,
+                })
+
+            # Signal the success to the frontend after the commit.
+            yield "data: [DONE]\n\n"
+
+        except GeneratorExit:
+            # The client has closed the stream.
+            db.rollback()
+            raise
+
+        except Exception as exc:
+            db.rollback()
+            print(
+                "Error while streaming RodiumAI:",
+                type(exc).__name__,
+                str(exc),
+            )
+            yield send_event({
+                "type": "error",
+                "message": (
+                    "The generation failed. "
+                    "The response was not recorded as complete."
+                ),
+            })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
