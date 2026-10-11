@@ -14,6 +14,8 @@ from database.db import get_db
 from database.models import Conversation, Message
 from pathlib import Path
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
 PROMPT_PATH = Path(__file__).parent / "prompts" / "system.md"
 
 
@@ -47,6 +49,22 @@ SYSTEM_PROMPT = (
     "Réponds aux questions de manière claire et concise."
 )
 
+ALLOWED_MODELS = [
+    model.strip()
+    for model in os.getenv("ALLOWED_MODELS", "").split(",")
+    if model.strip()
+]
+
+if len(ALLOWED_MODELS) < 2:
+    raise RuntimeError(
+        "ALLOWED_MODELS doit contenir au moins deux modèles."
+    )
+
+if MODEL not in ALLOWED_MODELS:
+    raise RuntimeError(
+        "RODIUMAI_MODEL doit appartenir à ALLOWED_MODELS."
+    )
+
 app = FastAPI(title="Study Buddy Chatbot")
 
 
@@ -76,8 +94,13 @@ class MessageResponse(BaseModel):
     seq: int
     role: str
     content: str
+    model: str | None = None
     created_at: datetime
 
+class ChatRequest(BaseModel):
+    conversation_id: int  # Garde le type déjà utilisé dans ton projet.
+    message: str
+    model: str
 
 def load_messages(db: Session, conversation_id: int) -> list[Message]:
     # A conversation's messages in order; 404 if the conversation doesn't exist.
@@ -129,7 +152,7 @@ def list_conversations(db: Session = Depends(get_db)) -> list[ConversationSummar
 @app.get("/conversations/{conversation_id}/messages")
 def list_messages(conversation_id: int, db: Session = Depends(get_db)) -> list[MessageResponse]:
     return [
-        MessageResponse(seq=m.seq, role=m.role, content=m.content, created_at=m.created_at)
+        MessageResponse(seq=m.seq, role=m.role, content=m.content, model=m.model, created_at=m.created_at)
         for m in load_messages(db, conversation_id)
     ]
 
@@ -180,6 +203,12 @@ def create_note(conversation_id: int, req: NoteRequest, db: Session = Depends(ge
 
 @app.post("/chat")
 def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
+    if req.model not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail="Modèle non autorisé.",
+        )
+
     # Load this conversation from the database, in message order.
     rows = load_messages(db, req.conversation_id)
     history = build_llm_history(rows)
@@ -216,7 +245,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": MODEL,
+                    "model": req.model,
                     "messages": messages,
                     "max_tokens": 512,
                     "stream": True,
@@ -270,7 +299,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
             # Only record the turn once the call succeeded, so a failure doesn't leave a dangling user message.
             db.add_all([
                 Message(conversation_id=req.conversation_id, seq=next_seq, role="user", content=req.message),
-                Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply),
+                Message(conversation_id=req.conversation_id, seq=next_seq + 1, role="assistant", content=reply, model=req.model),
             ])
 
             # Count only the dialogue (user + assistant): counting notifications too would shift the total
@@ -329,3 +358,10 @@ def chat(req: ChatRequest, db: Session = Depends(get_db)) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+@app.get("/models")
+def get_models():
+    return {
+        "models": ALLOWED_MODELS,
+        "default": MODEL,
+    }

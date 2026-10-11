@@ -28,4 +28,5 @@ class Message(Base):
     seq: Mapped[int]  # position of the message in its conversation, starting at 1
     role: Mapped[str] = mapped_column(String(20))  # "user" | "assistant"
     content: Mapped[str] = mapped_column(Text)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
